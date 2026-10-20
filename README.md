@@ -45,7 +45,7 @@ In the source code directory:
 ```
 ### 4. Open in browser 
 
-Open http://localhost:8002 on your browser and enjoy!
+Open your browser at **[http://127.0.0.1:8002](http://127.0.0.1:8002
 
 ## Manual Start
 
@@ -91,10 +91,10 @@ python app.py
 or with Uvicorn:
 
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8002 --reload
 ```
 
-Open your browser at **[http://127.0.0.1:8000](http://127.0.0.1:8000)**.
+Open your browser at **[http://127.0.0.1:8002](http://127.0.0.1:8002)**.
 
 ---
 
