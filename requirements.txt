@@ -1,0 +1,12 @@
+brotli
+certifi
+charset-normalizer
+idna
+mutagen
+pycryptodomex
+requests
+urllib3
+websockets
+yt-dlp
+fastapi
+uvicorn
