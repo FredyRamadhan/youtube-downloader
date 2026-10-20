@@ -45,7 +45,7 @@ In the source code directory:
 ```
 ### 4. Open in browser 
 
-Open your browser at **[http://127.0.0.1:8002](http://127.0.0.1:8002
+Open your browser at **[http://127.0.0.1:8002](http://127.0.0.1:8002)
 
 ## Manual Start
 
