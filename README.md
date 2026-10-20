@@ -4,7 +4,7 @@ A simple, modern, and powerful web-based GUI (built with **FastAPI** and a stati
 
 ---
 
-## 🌟 Features
+## Features
 
 - **Web-Based Interface**:
   - Clean, responsive dark-mode UI accessible from any modern browser.
@@ -23,7 +23,31 @@ A simple, modern, and powerful web-based GUI (built with **FastAPI** and a stati
 
 ---
 
-## 🚀 Quick Start (Web GUI)
+## Docker
+
+### 1. Requirements
+
+Ensure docker is installed on your system
+
+### 2. Build the Image
+
+In the source code directory:
+```bash
+    docker build -t yt-downloader .
+```
+
+### 3. Run Container
+```bash
+    docker run \
+    --name yt-dlp-gui
+    -p 8002:8002
+    yt-downloader:latest
+```
+### 4. Open in browser 
+
+Open http://localhost:8002 on your browser and enjoy!
+
+## Manual Start
 
 ### 1. Requirements
 
@@ -43,8 +67,8 @@ brew install ffmpeg
 
 ```bash
 # Create and activate virtual environment (if not already created)
-python3 -m venv ytdlpvenv
-source ytdlpvenv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
@@ -74,17 +98,8 @@ Open your browser at **[http://127.0.0.1:8000](http://127.0.0.1:8000)**.
 
 ---
 
-## 🖥️ Running the Desktop Tkinter GUI
 
-If you prefer the local Tkinter desktop GUI:
-
-```bash
-python yt-dlp-gui.py
-```
-
----
-
-## 📡 REST & WebSocket API
+## REST & WebSocket API
 
 The FastAPI server provides endpoints for programmatic usage or custom integrations:
 
@@ -103,7 +118,7 @@ The FastAPI server provides endpoints for programmatic usage or custom integrati
 
 ---
 
-## 📁 Directory Structure
+## Directory Structure
 
 ```text
 ├── app.py              # FastAPI backend & WebSocket handler
@@ -115,7 +130,3 @@ The FastAPI server provides endpoints for programmatic usage or custom integrati
 │   ├── style.css       # Clean dark-mode stylesheet
 │   └── app.js          # Client-side download manager & WebSocket logic
 ```
-
-> **Note:** downloads are staged in the system temp directory (`$TMPDIR/yt-dlp-gui`)
-> and removed after the browser saves them. Set an **Also Save Copy on Server**
-> path if you want the file kept permanently.
