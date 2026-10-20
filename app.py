@@ -1,9 +1,11 @@
 import asyncio
+import json
 import os
 import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -28,8 +30,34 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Downloads are staged in a per-task directory inside the system temp folder
+# (never in the source tree). Finished files are handed over to the browser's
+# own download manager and the staged copy is deleted afterwards.
+STAGING_ROOT = Path(tempfile.gettempdir()) / "yt-dlp-gui"
+STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Staged files are dropped a while after a task finishes so the browser has
+# time to fetch them (fallback in case the auto-download was blocked).
+STAGING_TTL_SECONDS = 30 * 60
+
+
+def _sweep_stale_staging() -> None:
+    """Remove staging leftovers from previous runs (tasks do not survive restarts)."""
+    now = time.time()
+    for entry in STAGING_ROOT.iterdir():
+        try:
+            if now - entry.stat().st_mtime < 300:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+_sweep_stale_staging()
 
 
 def get_yt_dlp_executable() -> str:
@@ -73,18 +101,21 @@ class InfoRequest(BaseModel):
 
 
 class DownloadTask:
-    def __init__(self, task_id: str, request: DownloadRequest, cmd: List[str], output_dir: Path):
+    def __init__(self, task_id: str, request: DownloadRequest, cmd: List[str], output_dir: Path,
+                 keep_server_copy: bool = False):
         self.task_id = task_id
         self.request = request
         self.cmd = cmd
         self.output_dir = output_dir
+        self.keep_server_copy = keep_server_copy
+        self.output_files: List[Path] = []
+        self.cleanup_handle: Optional[asyncio.Task] = None
         self.status = "queued"  # queued, downloading, postprocessing, completed, error, cancelled
         self.percent: float = 0.0
         self.speed: str = ""
         self.eta: str = ""
         self.total_size: str = ""
         self.current_filename: str = ""
-        self.logs: List[str] = []
         self.created_at = time.time()
         self.completed_at: Optional[float] = None
         self.return_code: Optional[int] = None
@@ -107,7 +138,6 @@ class DownloadTask:
             "completed_at": self.completed_at,
             "return_code": self.return_code,
             "error_message": self.error_message,
-            "logs_count": len(self.logs),
         }
 
     async def broadcast(self, message: dict):
@@ -144,15 +174,37 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def format_file_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    else:
-        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+def collect_output_files(root: Path) -> List[Path]:
+    """Final files produced by a task (ignores yt-dlp partial/temp artifacts)."""
+    temp_suffixes = {".part", ".ytdl", ".temp"}
+    files = [
+        p for p in root.rglob("*")
+        if p.is_file() and not p.name.startswith(".") and p.suffix.lower() not in temp_suffixes
+    ]
+    return sorted(files, key=lambda p: p.stat().st_mtime)
+
+
+def cleanup_task_staging(task: "DownloadTask") -> None:
+    """Delete the task's staged copy (never touches user-provided output dirs)."""
+    if task.keep_server_copy:
+        return
+    handle = task.cleanup_handle
+    if handle and handle is not asyncio.current_task() and not handle.done():
+        handle.cancel()
+    try:
+        if task.output_dir.exists() and task.output_dir.is_relative_to(STAGING_ROOT):
+            shutil.rmtree(task.output_dir, ignore_errors=True)
+    except OSError:
+        pass
+
+
+async def _expire_staging(task: "DownloadTask") -> None:
+    """Fallback cleanup for staged files the browser never fetched."""
+    try:
+        await asyncio.sleep(STAGING_TTL_SECONDS)
+    except asyncio.CancelledError:
+        return
+    cleanup_task_staging(task)
 
 
 async def run_download_process(task: DownloadTask):
@@ -161,7 +213,6 @@ async def run_download_process(task: DownloadTask):
         "type": "status",
         "task_id": task.task_id,
         "status": task.status,
-        "log": f"Starting command: {' '.join(shlex.quote(c) for c in task.cmd)}"
     })
 
     try:
@@ -172,6 +223,8 @@ async def run_download_process(task: DownloadTask):
             cwd=str(task.output_dir)
         )
 
+        # Read yt-dlp output, but only extract progress/status metrics —
+        # raw output is never stored or forwarded to clients.
         while True:
             line_bytes = await task.process.stdout.readline()
             if not line_bytes:
@@ -179,13 +232,6 @@ async def run_download_process(task: DownloadTask):
             line = line_bytes.decode('utf-8', errors='replace').rstrip('\r\n')
             if not line:
                 continue
-
-            # Record in logs
-            if len(task.logs) < 1500:
-                task.logs.append(line)
-            else:
-                task.logs.pop(0)
-                task.logs.append(line)
 
             # Check for destination file
             dest_match = DESTINATION_RE.search(line)
@@ -232,12 +278,6 @@ async def run_download_process(task: DownloadTask):
             elif "[ExtractAudio]" in line or "[Merger]" in line or "[Fixup" in line:
                 task.status = "postprocessing"
 
-            await task.broadcast({
-                "type": "log",
-                "task_id": task.task_id,
-                "line": line
-            })
-
         return_code = await task.process.wait()
         task.return_code = return_code
         task.completed_at = time.time()
@@ -245,23 +285,23 @@ async def run_download_process(task: DownloadTask):
         if return_code == 0:
             task.status = "completed"
             task.percent = 100.0
-            log_msg = "Download completed successfully!"
+            task.output_files = collect_output_files(task.output_dir)
+            if not task.keep_server_copy:
+                task.cleanup_handle = asyncio.create_task(_expire_staging(task))
         else:
             if task.status != "cancelled":
                 task.status = "error"
                 task.error_message = f"Process exited with code {return_code}"
-                log_msg = f"Download ended with error (exit code: {return_code})"
-            else:
-                log_msg = "Download was cancelled."
+            cleanup_task_staging(task)
 
-        task.logs.append(log_msg)
         await task.broadcast({
             "type": "complete",
             "task_id": task.task_id,
             "status": task.status,
             "return_code": return_code,
             "error": task.error_message,
-            "log": log_msg
+            "files": [p.name for p in task.output_files],
+            "kept": task.keep_server_copy,
         })
 
     except asyncio.CancelledError:
@@ -272,22 +312,22 @@ async def run_download_process(task: DownloadTask):
                 task.process.terminate()
             except Exception:
                 pass
+        cleanup_task_staging(task)
         await task.broadcast({
             "type": "complete",
             "task_id": task.task_id,
             "status": "cancelled",
-            "log": "Download cancelled by user"
         })
     except Exception as e:
         task.status = "error"
         task.error_message = str(e)
         task.completed_at = time.time()
+        cleanup_task_staging(task)
         await task.broadcast({
             "type": "complete",
             "task_id": task.task_id,
             "status": "error",
             "error": str(e),
-            "log": f"Internal task error: {e}"
         })
 
 
@@ -295,7 +335,6 @@ async def run_download_process(task: DownloadTask):
 
 @app.get("/api/status")
 async def get_system_status():
-    yt_bin = get_yt_dlp_executable()
     ffmpeg_bin = shutil.which("ffmpeg")
 
     yt_ver = None
@@ -305,11 +344,8 @@ async def get_system_status():
         pass
 
     return {
-        "yt_dlp_executable": yt_bin,
         "yt_dlp_version": yt_ver,
         "ffmpeg_available": bool(ffmpeg_bin),
-        "ffmpeg_path": ffmpeg_bin,
-        "download_dir": str(DOWNLOAD_DIR),
         "active_tasks_count": sum(1 for t in tasks.values() if t.status in ("queued", "downloading", "postprocessing"))
     }
 
@@ -370,15 +406,19 @@ async def start_download(req: DownloadRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
 
-    # Target directory
-    target_dir = DOWNLOAD_DIR
+    # Target directory: staged in system temp by default (delivered to the
+    # browser afterwards), or kept permanently when the user names a server path.
+    keep_server_copy = False
     if req.output_path and req.output_path.strip():
-        custom_path = Path(req.output_path.strip())
+        custom_path = Path(req.output_path.strip()).expanduser()
         try:
             custom_path.mkdir(parents=True, exist_ok=True)
             target_dir = custom_path
+            keep_server_copy = True
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Cannot use output directory: {e}")
+    else:
+        target_dir = Path(tempfile.mkdtemp(prefix="task-", dir=str(STAGING_ROOT)))
 
     # Build yt-dlp command
     yt_bin = get_yt_dlp_executable()
@@ -434,7 +474,7 @@ async def start_download(req: DownloadRequest):
     cmd.append(url)
 
     task_id = str(uuid.uuid4())[:8]
-    task = DownloadTask(task_id, req, cmd, target_dir)
+    task = DownloadTask(task_id, req, cmd, target_dir, keep_server_copy=keep_server_copy)
 
     async with tasks_lock:
         tasks[task_id] = task
@@ -445,8 +485,6 @@ async def start_download(req: DownloadRequest):
     return {
         "task_id": task_id,
         "status": "queued",
-        "command": " ".join(shlex.quote(c) for c in cmd),
-        "output_dir": str(target_dir)
     }
 
 
@@ -462,9 +500,7 @@ async def get_task_details(task_id: str):
         task = tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        data = task.to_dict()
-        data["logs"] = task.logs[-300:]  # Return last 300 logs
-        return data
+        return task.to_dict()
 
 
 @app.post("/api/tasks/{task_id}/cancel")
@@ -505,11 +541,10 @@ async def task_websocket(websocket: WebSocket, task_id: str):
     queue = asyncio.Queue()
     task.subscribers.add(queue)
 
-    # Send initial state and recent logs
+    # Send initial state
     await websocket.send_json({
         "type": "init",
         "task": task.to_dict(),
-        "recent_logs": task.logs[-100:]
     })
 
     try:
@@ -545,64 +580,32 @@ async def task_websocket(websocket: WebSocket, task_id: str):
         task.subscribers.discard(queue)
 
 
-# --- Downloaded Files Management ---
+# --- Task File Delivery (browser download) ---
 
-@app.get("/api/files")
-async def list_files():
-    if not DOWNLOAD_DIR.exists():
-        return []
-
-    files_list = []
-    video_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv"}
-    audio_exts = {".mp3", ".m4a", ".wav", ".flac", ".opus", ".aac", ".ogg"}
-
-    for item in sorted(DOWNLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if item.is_file() and not item.name.startswith("."):
-            stat = item.stat()
-            ext = item.suffix.lower()
-            file_type = "video" if ext in video_exts else "audio" if ext in audio_exts else "other"
-            files_list.append({
-                "name": item.name,
-                "size_bytes": stat.st_size,
-                "size_formatted": format_file_size(stat.st_size),
-                "modified": stat.st_mtime,
-                "modified_formatted": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
-                "ext": ext.lstrip("."),
-                "file_type": file_type
-            })
-
-    return files_list
-
-
-@app.get("/api/files/{filename}")
-async def download_file(filename: str):
-    # Prevent directory traversal
-    safe_path = (DOWNLOAD_DIR / filename).resolve()
-    if not str(safe_path).startswith(str(DOWNLOAD_DIR.resolve())):
-        raise HTTPException(status_code=403, detail="Forbidden file path")
-    if not safe_path.is_file():
+@app.get("/api/tasks/{task_id}/files/{file_index}")
+async def fetch_task_file(task_id: str, file_index: int):
+    """Serve a finished file as a normal browser download (attachment)."""
+    async with tasks_lock:
+        task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if file_index < 0 or file_index >= len(task.output_files):
         raise HTTPException(status_code=404, detail="File not found")
+
+    path = task.output_files[file_index]
+    try:
+        path.resolve().relative_to(task.output_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Forbidden file path")
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="File is no longer available on the server")
 
     return FileResponse(
-        path=safe_path,
-        filename=filename,
-        media_type="application/octet-stream"
+        path=path,
+        filename=path.name,
+        media_type="application/octet-stream",
+        content_disposition_type="attachment",
     )
-
-
-@app.delete("/api/files/{filename}")
-async def delete_file(filename: str):
-    safe_path = (DOWNLOAD_DIR / filename).resolve()
-    if not str(safe_path).startswith(str(DOWNLOAD_DIR.resolve())):
-        raise HTTPException(status_code=403, detail="Forbidden file path")
-    if not safe_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    try:
-        safe_path.unlink()
-        return {"status": "success", "message": f"Deleted {filename}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete file: {e}")
 
 
 # --- Static Frontend ---

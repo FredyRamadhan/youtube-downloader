@@ -13,10 +13,10 @@ A simple, modern, and powerful web-based GUI (built with **FastAPI** and a stati
     - **Video + Audio**: Best available, 1080p, 720p, 480p, 360p, or custom `-f` format strings.
     - **Audio Only**: MP3, M4A, FLAC, WAV, OPUS, with automatic thumbnail cover art embedding.
   - Subtitle options: Manual subs, auto-generated subs, language filters (e.g. `en,es`).
-  - Output template & custom directory support.
+  - Output template support, plus an optional server-side copy path.
   - Extra arguments field for any additional `yt-dlp` CLI flags.
-  - Real-time download progress bar, speed, ETA, and live streaming console logs via **WebSocket**.
-  - Built-in **Downloads Library**: view downloaded files, preview/stream directly in browser (`<video>` / `<audio>` modal), download to device, or delete.
+  - Real-time download progress bar, speed and ETA via **WebSocket**.
+  - Finished files are handed to the **browser's own download manager** (saved to your normal Downloads folder). The server stages files in the system temp dir and deletes them after transfer.
   - Interactive OpenAPI docs at `/docs`.
 - **Desktop Tkinter Interface**:
   - Classic lightweight local desktop GUI (`yt-dlp-gui.py`).
@@ -95,12 +95,10 @@ The FastAPI server provides endpoints for programmatic usage or custom integrati
 | `POST` | `/api/info` | Fetch metadata & available qualities for a given URL |
 | `POST` | `/api/download` | Start a new download task |
 | `GET` | `/api/tasks` | List recent download tasks & status |
-| `GET` | `/api/tasks/{task_id}` | Get specific task progress and logs |
+| `GET` | `/api/tasks/{task_id}` | Get specific task progress |
 | `POST` | `/api/tasks/{task_id}/cancel` | Cancel an active download |
-| `WS` | `/ws/tasks/{task_id}` | WebSocket stream for live logs and progress events |
-| `GET` | `/api/files` | List files in the download folder |
-| `GET` | `/api/files/{filename}` | Stream or download a file |
-| `DELETE` | `/api/files/{filename}` | Delete a downloaded file |
+| `GET` | `/api/tasks/{task_id}/files/{index}` | Download a finished file (attachment) |
+| `WS` | `/ws/tasks/{task_id}` | WebSocket stream for live progress events |
 | `GET` | `/docs` | Swagger interactive OpenAPI documentation |
 
 ---
@@ -116,5 +114,8 @@ The FastAPI server provides endpoints for programmatic usage or custom integrati
 │   ├── index.html      # Responsive web UI
 │   ├── style.css       # Clean dark-mode stylesheet
 │   └── app.js          # Client-side download manager & WebSocket logic
-└── downloads/          # Default directory for downloaded media
 ```
+
+> **Note:** downloads are staged in the system temp directory (`$TMPDIR/yt-dlp-gui`)
+> and removed after the browser saves them. Set an **Also Save Copy on Server**
+> path if you want the file kept permanently.

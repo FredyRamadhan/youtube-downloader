@@ -2,7 +2,6 @@
 
 let currentTaskId = null;
 let currentSocket = null;
-let allLibraryFiles = [];
 
 // DOM Elements
 const urlInput = document.getElementById("urlInput");
@@ -51,58 +50,18 @@ const statPercent = document.getElementById("statPercent");
 const statSpeed = document.getElementById("statSpeed");
 const statEta = document.getElementById("statEta");
 const statSize = document.getElementById("statSize");
-const terminalOutput = document.getElementById("terminalOutput");
-const autoScrollCheckbox = document.getElementById("autoScrollCheckbox");
-const copyLogBtn = document.getElementById("copyLogBtn");
-const clearLogBtn = document.getElementById("clearLogBtn");
-
-// Library Elements
-const libraryTable = document.getElementById("libraryTable");
-const libraryTableBody = document.getElementById("libraryTableBody");
-const libraryLoading = document.getElementById("libraryLoading");
-const libraryEmpty = document.getElementById("libraryEmpty");
-const libraryCountBadge = document.getElementById("libraryCountBadge");
-const refreshLibraryBtn = document.getElementById("refreshLibraryBtn");
-const librarySearchInput = document.getElementById("librarySearchInput");
-
-// Modal Elements
-const mediaModal = document.getElementById("mediaModal");
-const modalMediaTitle = document.getElementById("modalMediaTitle");
-const modalMediaContainer = document.getElementById("modalMediaContainer");
-const modalCloseBtn = document.getElementById("modalCloseBtn");
+const completedFiles = document.getElementById("completedFiles");
+const completedFilesLabel = document.getElementById("completedFilesLabel");
+const completedFilesList = document.getElementById("completedFilesList");
 
 
 // --- Application Initialization ---
 document.addEventListener("DOMContentLoaded", () => {
-    initTabs();
     initUrlInput();
     initOptions();
     initMonitorActions();
-    initLibrary();
-    initModal();
     checkSystemStatus();
-    loadLibraryFiles();
 });
-
-
-// --- Tab Navigation ---
-function initTabs() {
-    const tabButtons = document.querySelectorAll(".tab-btn");
-    tabButtons.forEach(btn => {
-        btn.addEventListener("click", () => {
-            const targetTab = btn.getAttribute("data-tab");
-            tabButtons.forEach(b => b.classList.remove("active"));
-            document.querySelectorAll(".tab-pane").forEach(pane => pane.classList.remove("active"));
-
-            btn.classList.add("active");
-            document.getElementById(targetTab).classList.add("active");
-
-            if (targetTab === "tab-library") {
-                loadLibraryFiles();
-            }
-        });
-    });
-}
 
 
 // --- System Status ---
@@ -348,7 +307,8 @@ function openTaskMonitor(taskId) {
     statSpeed.textContent = "Speed: --";
     statEta.textContent = "ETA: --";
     statSize.textContent = "Size: --";
-    terminalOutput.textContent = "";
+    completedFiles.style.display = "none";
+    completedFilesList.innerHTML = "";
 
     // Connect WebSocket
     connectTaskSocket(taskId);
@@ -363,21 +323,13 @@ function connectTaskSocket(taskId) {
     const wsUrl = `${protocol}//${location.host}/ws/tasks/${taskId}`;
     currentSocket = new WebSocket(wsUrl);
 
-    currentSocket.onopen = () => {
-        appendTerminalLine(`[System] Connected to task stream for ${taskId}`);
-    };
-
     currentSocket.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
             handleTaskEvent(data);
         } catch (e) {
-            console.error("Failed to parse WebSocket message:", event.data);
+            console.error("Failed to parse WebSocket message");
         }
-    };
-
-    currentSocket.onerror = (err) => {
-        appendTerminalLine("[System] WebSocket connection error. Polling task status...");
     };
 
     currentSocket.onclose = () => {
@@ -393,24 +345,17 @@ function handleTaskEvent(data) {
                 updateProgress(data.task.percent, data.task.speed, data.task.eta, data.task.total_size);
             }
         }
-        if (data.recent_logs) {
-            data.recent_logs.forEach(appendTerminalLine);
-        }
     } else if (data.type === "status") {
         updateStatusBadge(data.status);
-        if (data.log) appendTerminalLine(data.log);
     } else if (data.type === "progress") {
         updateProgress(data.percent, data.speed, data.eta, data.total_size);
         if (data.status) updateStatusBadge(data.status);
-    } else if (data.type === "log") {
-        appendTerminalLine(data.line);
     } else if (data.type === "complete") {
         updateStatusBadge(data.status);
-        if (data.log) appendTerminalLine(data.log);
 
         if (data.status === "completed") {
             updateProgress(100.0, "", "00:00", "");
-            showToast("Download finished successfully!", "success");
+            deliverFilesToBrowser(data);
         } else if (data.status === "cancelled") {
             showToast("Download cancelled", "info");
         } else {
@@ -418,7 +363,50 @@ function handleTaskEvent(data) {
         }
 
         resetDownloadButton();
-        loadLibraryFiles();
+    }
+}
+
+// Hand finished files over to the browser's own download manager, then the
+// server deletes its staged copy (unless the user asked to keep one).
+function deliverFilesToBrowser(taskEvent) {
+    const files = taskEvent.files || [];
+    const taskId = taskEvent.task_id;
+
+    if (!files.length) {
+        showToast("Download finished, but no output files were found", "error");
+        return;
+    }
+
+    completedFiles.style.display = "block";
+    completedFilesLabel.textContent = taskEvent.kept
+        ? "Sent to your browser and kept on the server"
+        : "Saved to your browser's Downloads";
+    completedFilesList.innerHTML = "";
+
+    files.forEach((name, index) => {
+        const link = document.createElement("a");
+        link.href = `/api/tasks/${taskId}/files/${index}`;
+        link.download = name;
+        link.textContent = name;
+        link.className = "completed-file-link";
+        completedFilesList.appendChild(link);
+
+        // Trigger the actual browser download (staggered so playlists
+        // don't get blocked as a burst of simultaneous downloads)
+        setTimeout(() => {
+            const trigger = document.createElement("a");
+            trigger.href = link.href;
+            trigger.download = name;
+            document.body.appendChild(trigger);
+            trigger.click();
+            trigger.remove();
+        }, 400 + index * 800);
+    });
+
+    if (taskEvent.kept) {
+        showToast("Download finished — file(s) sent to your browser", "success");
+    } else {
+        showToast("Download finished — saving to your browser", "success");
     }
 }
 
@@ -442,14 +430,6 @@ function updateStatusBadge(status) {
     }
 }
 
-function appendTerminalLine(line) {
-    if (!line) return;
-    terminalOutput.textContent += line + "\n";
-    if (autoScrollCheckbox.checked) {
-        terminalOutput.scrollTop = terminalOutput.scrollHeight;
-    }
-}
-
 function resetDownloadButton() {
     startDownloadBtn.disabled = false;
     startDownloadBtn.innerHTML = `
@@ -470,183 +450,6 @@ function initMonitorActions() {
             showToast("Failed to send cancel signal", "error");
         }
     });
-
-    copyLogBtn.addEventListener("click", () => {
-        navigator.clipboard.writeText(terminalOutput.textContent).then(() => {
-            showToast("Logs copied to clipboard", "success");
-        }).catch(() => {
-            showToast("Failed to copy logs", "error");
-        });
-    });
-
-    clearLogBtn.addEventListener("click", () => {
-        terminalOutput.textContent = "";
-    });
-}
-
-
-// --- Downloads Library ---
-function initLibrary() {
-    refreshLibraryBtn.addEventListener("click", loadLibraryFiles);
-
-    librarySearchInput.addEventListener("input", () => {
-        const query = librarySearchInput.value.toLowerCase().trim();
-        const filtered = allLibraryFiles.filter(f => f.name.toLowerCase().includes(query));
-        renderLibraryTable(filtered);
-    });
-}
-
-async function loadLibraryFiles() {
-    libraryLoading.style.display = "flex";
-    libraryEmpty.style.display = "none";
-    libraryTable.style.display = "none";
-
-    try {
-        const res = await fetch("/api/files");
-        if (!res.ok) throw new Error("Failed to load files");
-        allLibraryFiles = await res.json();
-
-        libraryCountBadge.textContent = allLibraryFiles.length;
-
-        if (allLibraryFiles.length === 0) {
-            libraryEmpty.style.display = "flex";
-        } else {
-            renderLibraryTable(allLibraryFiles);
-            libraryTable.style.display = "table";
-        }
-    } catch (err) {
-        showToast("Error loading downloads library", "error");
-    } finally {
-        libraryLoading.style.display = "none";
-    }
-}
-
-function renderLibraryTable(files) {
-    libraryTableBody.innerHTML = "";
-
-    if (files.length === 0) {
-        libraryEmpty.style.display = "flex";
-        libraryTable.style.display = "none";
-        return;
-    }
-
-    libraryEmpty.style.display = "none";
-    libraryTable.style.display = "table";
-
-    files.forEach(file => {
-        const tr = document.createElement("tr");
-
-        // Icon based on type
-        let iconSvg = '';
-        if (file.file_type === 'video') {
-            iconSvg = `<svg class="file-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>`;
-        } else if (file.file_type === 'audio') {
-            iconSvg = `<svg class="file-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
-        } else {
-            iconSvg = `<svg class="file-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
-        }
-
-        const encodedName = encodeURIComponent(file.name);
-        const fileUrl = `/api/files/${encodedName}`;
-
-        tr.innerHTML = `
-            <td>
-                <div class="file-name-cell">
-                    ${iconSvg}
-                    <span>${escapeHtml(file.name)}</span>
-                </div>
-            </td>
-            <td><span class="ext-badge ${file.file_type}">${escapeHtml(file.ext)}</span></td>
-            <td>${escapeHtml(file.size_formatted)}</td>
-            <td>${escapeHtml(file.modified_formatted)}</td>
-            <td class="text-right">
-                <div class="row-actions">
-                    ${file.file_type !== 'other' ? `
-                    <button class="btn btn-secondary btn-sm preview-btn" data-url="${fileUrl}" data-type="${file.file_type}" data-name="${escapeHtml(file.name)}" title="Preview in browser">
-                        ▶ Play
-                    </button>` : ''}
-                    <a href="${fileUrl}" download class="btn btn-primary btn-sm" title="Download to device">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    </a>
-                    <button class="btn btn-danger btn-sm delete-btn" data-name="${escapeHtml(file.name)}" title="Delete file">
-                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                    </button>
-                </div>
-            </td>
-        `;
-
-        libraryTableBody.appendChild(tr);
-    });
-
-    // Wire up preview and delete buttons
-    document.querySelectorAll(".preview-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-            const url = btn.getAttribute("data-url");
-            const type = btn.getAttribute("data-type");
-            const name = btn.getAttribute("data-name");
-            openMediaPreview(url, type, name);
-        });
-    });
-
-    document.querySelectorAll(".delete-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-            const name = btn.getAttribute("data-name");
-            deleteFile(name);
-        });
-    });
-}
-
-async function deleteFile(filename) {
-    if (!confirm(`Are you sure you want to delete "${filename}"?`)) return;
-
-    try {
-        const res = await fetch(`/api/files/${encodeURIComponent(filename)}`, { method: "DELETE" });
-        if (!res.ok) throw new Error("Delete failed");
-        showToast(`Deleted ${filename}`, "success");
-        loadLibraryFiles();
-    } catch (err) {
-        showToast(err.message, "error");
-    }
-}
-
-
-// --- Media Player Modal ---
-function initModal() {
-    modalCloseBtn.addEventListener("click", closeMediaModal);
-    mediaModal.addEventListener("click", (e) => {
-        if (e.target === mediaModal) closeMediaModal();
-    });
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && mediaModal.style.display !== "none") {
-            closeMediaModal();
-        }
-    });
-}
-
-function openMediaPreview(url, fileType, title) {
-    modalMediaTitle.textContent = title;
-    modalMediaContainer.innerHTML = "";
-
-    if (fileType === "video") {
-        const video = document.createElement("video");
-        video.controls = true;
-        video.autoplay = true;
-        video.src = url;
-        modalMediaContainer.appendChild(video);
-    } else {
-        const audio = document.createElement("audio");
-        audio.controls = true;
-        audio.autoplay = true;
-        audio.src = url;
-        modalMediaContainer.appendChild(audio);
-    }
-
-    mediaModal.style.display = "flex";
-}
-
-function closeMediaModal() {
-    mediaModal.style.display = "none";
-    modalMediaContainer.innerHTML = "";
 }
 
 
